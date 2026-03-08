@@ -22,7 +22,6 @@ def _pip(pkg):
                    capture_output=True)
 
 for _pkg, _imp in [
-    ("pykrx",              "pykrx"),
     ("finance-datareader", "FinanceDataReader"),
     ("plotly",             "plotly"),
     ("pandas",             "pandas"),
@@ -42,17 +41,22 @@ try:
     import pandas as pd
     import numpy as np
     import FinanceDataReader as fdr
-    from pykrx import stock as pyk
     import plotly.graph_objects as go
     import OpenDartReader as odr
     READY = True
 except ImportError as e:
     st.error(
         f"패키지 로드 실패: {e}\n\n"
-        "아나콘다 프롬프트에서 아래 명령어 실행 후 앱 재시작:\n"
-        "`pip install pykrx finance-datareader plotly opendartreader`"
+        "아래 명령어 실행 후 앱 재시작:\n"
+        "`pip install finance-datareader plotly opendartreader`"
     )
     st.stop()
+
+# pykrx: 선택적 의존성 (종목명 폴백용 — 없어도 DART로 대체)
+try:
+    from pykrx import stock as pyk
+except Exception:
+    pyk = None
 
 # ── CSS ───────────────────────────────────────────────────────
 st.markdown("""
@@ -179,11 +183,13 @@ def get_stock_name(ticker: str, corp_codes: pd.DataFrame = None) -> str:
         row = corp_codes[corp_codes["stock_code"] == ticker]
         if not row.empty:
             return row.iloc[0]["corp_name"]
-    try:
-        n = pyk.get_market_ticker_name(ticker)
-        return n if n else ticker
-    except Exception:
-        return ticker
+    if pyk is not None:
+        try:
+            n = pyk.get_market_ticker_name(ticker)
+            return n if n else ticker
+        except Exception:
+            pass
+    return ticker
 
 
 def year_end_price(ticker: str, year: int) -> float | None:
