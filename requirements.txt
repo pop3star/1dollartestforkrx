@@ -1,0 +1,7 @@
+streamlit>=1.32.0
+pandas>=1.5.0
+numpy>=1.24.0
+finance-datareader>=0.9.50
+plotly>=5.18.0
+OpenDartReader>=0.7.0
+pykrx>=1.0.46
