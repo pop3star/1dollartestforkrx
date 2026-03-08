@@ -614,15 +614,20 @@ with st.sidebar:
         pass
 
     st.markdown("#### 🔑 DART API 키")
-    dart_api_key = st.text_input(
+    _dart_input = st.text_input(
         label="금융감독원 DART API 키",
         type="password",
-        value=_secret_key,
-        placeholder="opendart.fss.or.kr 에서 발급한 인증키",
+        value="",
+        placeholder="비워두면 서버 기본 키 사용 / 직접 입력 시 대체",
         help="https://opendart.fss.or.kr 에서 무료 발급 (이메일 인증 즉시 사용 가능)",
     )
-    if _secret_key:
-        st.caption("🔒 서버 Secrets에서 API 키가 자동 로드되었습니다.")
+    # 직접 입력 우선, 없으면 서버 Secret 키 폴백
+    dart_api_key = _dart_input if _dart_input else _secret_key
+
+    if _secret_key and not _dart_input:
+        st.caption("🔒 서버 기본 키 사용 중 — 직접 입력하면 해당 키로 대체됩니다.")
+    elif _dart_input:
+        st.caption("🔑 직접 입력한 API 키를 사용합니다.")
 
     if not dart_api_key:
         st.markdown("""<div class="dart-box">
