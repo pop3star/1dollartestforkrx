@@ -284,10 +284,75 @@ def get_eps_dps_latest(ticker: str, year: int,
     return None, None
 
 
+def adjust_eps_for_splits(fund_by_year: dict, log_fn=None) -> tuple[dict, list]:
+    """
+    연도별 EPS의 급격한 변동을 감지하여 액면분할/병합 보정.
+    FinanceDataReader 주가는 수정주가(split-adjusted)인 반면,
+    DART EPS는 해당 연도 실제 주식수 기준이므로 불일치 발생.
+    → 모든 EPS를 최신(현재) 주식수 기준으로 통일.
+    반환: (보정된 fund_by_year, 감지된 이벤트 목록)
+    """
+    years = sorted(fund_by_year.keys())
+    if len(years) < 2:
+        return fund_by_year, []
+
+    def _log(msg):
+        if log_fn:
+            log_fn(msg)
+
+    events: list[tuple[int, float, str]] = []   # (year, ratio, description)
+
+    for i in range(1, len(years)):
+        eps_prev = fund_by_year[years[i - 1]]["EPS"]
+        eps_curr = fund_by_year[years[i]]["EPS"]
+        if eps_prev is None or eps_curr is None:
+            continue
+        if eps_prev <= 0 or eps_curr <= 0:
+            continue
+
+        ratio = eps_prev / eps_curr
+        common = [2, 3, 4, 5, 10, 20, 25, 50, 100]
+
+        if ratio > 1.8:
+            # 액면분할 감지 (EPS 급감)
+            best = min(common, key=lambda x: abs(x - ratio))
+            if abs(best - ratio) / best < 0.30:
+                desc = f"{years[i]}년 액면분할 {best}:1 감지 (EPS {eps_prev:,.0f}→{eps_curr:,.0f})"
+                events.append((years[i], float(best), desc))
+                _log(f"⚠️ {desc}")
+        elif ratio < 0.55:
+            # 액면병합(역분할) 감지 (EPS 급증)
+            inv = 1 / ratio
+            best = min(common, key=lambda x: abs(x - inv))
+            if abs(best - inv) / best < 0.30:
+                factor = 1.0 / best
+                desc = f"{years[i]}년 액면병합 1:{best} 감지 (EPS {eps_prev:,.0f}→{eps_curr:,.0f})"
+                events.append((years[i], factor, desc))
+                _log(f"⚠️ {desc}")
+
+    if not events:
+        return fund_by_year, []
+
+    # 보정: 분할 이전 연도 EPS를 현재 주식수 기준으로 축소
+    adjusted = {}
+    for y in years:
+        divisor = 1.0
+        for ev_year, ev_ratio, _ in events:
+            if y < ev_year:
+                divisor *= ev_ratio
+        adjusted[y] = {
+            "EPS": round(fund_by_year[y]["EPS"] / divisor, 2),
+            "DPS": round(fund_by_year[y]["DPS"] / divisor, 2),
+        }
+
+    return adjusted, events
+
+
 def analyze_stock(
     ticker: str,
     start_year: int,
     end_year: int,
+    start_month: int = 12,        # ← NEW: 시작 월 (1~12). 12이면 연말 기준
     end_month: int = 12,          # ← NEW: 종료 월 (1~12). 12이면 연말 기준
     dart_inst=None,
     corp_codes: pd.DataFrame = None,
@@ -301,9 +366,18 @@ def analyze_stock(
     name = get_stock_name(ticker, corp_codes)
     log(f"[{ticker}] {name} — 주가 수집 중...")
 
-    # ── 연말 주가 수집 (start_year ~ end_year-1, 차트용) ──────────
+    # ── 시작 시점 주가 (지정 연월 마지막 거래일) ─────────────────
+    if start_month != 12:
+        start_price_raw = get_month_end_price(ticker, start_year, start_month)
+    else:
+        start_price_raw = year_end_price(ticker, start_year)
+
+    # ── 연말 주가 수집 (start_year+1 ~ end_year-1, 차트용) ──────
     price_by_year: dict[int, float] = {}
-    for y in range(start_year, end_year):          # end_year 연말은 따로 처리
+    if start_price_raw is not None:
+        price_by_year[start_year] = start_price_raw
+
+    for y in range(start_year + 1, end_year):      # 중간 연도 연말가
         p = year_end_price(ticker, y)
         if p:
             price_by_year[y] = p
@@ -316,13 +390,16 @@ def analyze_stock(
     if end_price is not None:
         price_by_year[end_year] = end_price
 
-    if len(price_by_year) < 3:
+    if len(price_by_year) < 2:                     # ★ 임계값 3→2 (한화솔루션 대응)
         log(f"[{ticker}] 주가 데이터 부족 ({len(price_by_year)}년) — 건너뜀")
         return None
 
     avail       = sorted(price_by_year)
     act_start   = avail[0]
     start_price = price_by_year[act_start]
+
+    # 실제 시작 월: 사용자 지정 start_month은 act_start == start_year 일 때만 유효
+    act_start_month = start_month if act_start == start_year else 12
 
     if end_price is None:
         log(f"[{ticker}] 종료 시점 주가 없음 — 건너뜀")
@@ -352,16 +429,22 @@ def analyze_stock(
             fund_by_year[y] = fd
         time.sleep(0.2)
 
-    if len(fund_by_year) < 3:
+    if len(fund_by_year) < 2:                      # ★ 임계값 3→2 (한화솔루션 대응)
         log(f"[{ticker}] 재무 데이터 부족 ({len(fund_by_year)}개년) — 건너뜀")
         return None
+
+    # ── 액면분할/병합 EPS 보정 ─────────────────────────────────
+    fund_by_year, split_events = adjust_eps_for_splits(fund_by_year, log_fn=log)
+    if split_events:
+        log(f"[{ticker}] 액면분할/병합 {len(split_events)}건 감지 → EPS/DPS 보정 적용")
 
     # ── $1 테스트 계산 ─────────────────────────────────────────
     total_retained = sum(v["EPS"] - v["DPS"] for v in fund_by_year.values())
     price_appr     = end_price - start_price
 
-    # 분석 기간(연수): 소수점 지원 (예: 2010.12 → 2026.03 = 15.25년)
-    n_years_frac = (end_year - act_start) + (end_month - 12) / 12
+    # 분석 기간(연수): 시작월·종료월 모두 반영
+    # 예: 2010.06 → 2026.03 = (2026 - 2010) + (3 - 6)/12 = 15.75년
+    n_years_frac = (end_year - act_start) + (end_month - act_start_month) / 12
     n_years_frac = max(n_years_frac, 0.5)   # 최소 0.5년
 
     if total_retained > 0:
@@ -384,7 +467,13 @@ def analyze_stock(
             cum  += ret_y
         else:
             ret_y = None
-        label = f"{y}.{end_month:02d}" if y == end_year and end_month != 12 else str(y)
+        # 시작/종료 연도에 월 라벨 표시
+        if y == start_year and act_start_month != 12:
+            label = f"{y}.{act_start_month:02d}"
+        elif y == end_year and end_month != 12:
+            label = f"{y}.{end_month:02d}"
+        else:
+            label = str(y)
         chart_data.append({
             "year":         label,
             "close":        price_by_year.get(y),
@@ -395,7 +484,8 @@ def analyze_stock(
             "cum_retained": round(cum, 0),
         })
 
-    end_label = f"{end_year}.{end_month:02d}" if end_month != 12 else str(end_year)
+    start_label = f"{act_start}.{act_start_month:02d}" if act_start_month != 12 else str(act_start)
+    end_label   = f"{end_year}.{end_month:02d}" if end_month != 12 else str(end_year)
     status = "✅ 통과" if passed else (
         "❌ 미통과" if dollar_ratio is not None else "⚠️ 계산불가"
     )
@@ -408,6 +498,8 @@ def analyze_stock(
         "ticker":                 ticker,
         "name":                   name,
         "start_year":             act_start,
+        "start_month":            act_start_month,
+        "start_label":            start_label,
         "end_year":               end_year,
         "end_month":              end_month,
         "end_label":              end_label,
@@ -422,6 +514,7 @@ def analyze_stock(
         "passed":                 passed,
         "price_cagr":             round(price_cagr, 1) if price_cagr is not None else None,
         "data_years_count":       len(fund_by_year),
+        "split_events":           split_events,
         "chart_data":             chart_data,
     }
 
@@ -550,7 +643,7 @@ function render(){
   document.getElementById('tbody').innerHTML=getData().map(x=>`
   <tr onclick="showDetail('${x.ticker}')">
   <td><strong>${x.name}</strong></td><td style="color:#8b949e">${x.ticker}</td>
-  <td style="color:#8b949e;font-size:.81em">${x.start_year}~${x.end_label}(${x.years_analyzed}y)</td>
+  <td style="color:#8b949e;font-size:.81em">${x.start_label}~${x.end_label}(${x.years_analyzed}y)</td>
   <td>${N(x.start_price)}원</td><td>${N(x.end_price)}원</td>
   <td>${Pct(x.price_appreciation_pct)}</td><td>${Pct(x.price_cagr)}</td>
   <td>${N(x.total_retained_eps)}원</td><td>${Ratio(x.dollar_test_ratio)}</td>
@@ -562,7 +655,7 @@ function setSort(s){sort=s;render();}
 function showDetail(ticker){
   const x=DATA.find(d=>d.ticker===ticker);if(!x)return;
   document.getElementById('d-title').textContent=x.name;
-  document.getElementById('d-sub').textContent=`코드:${x.ticker} | 기간:${x.start_year}~${x.end_label}(${x.years_analyzed}년) | 재무확보:${x.data_years_count}개년`;
+  document.getElementById('d-sub').textContent=`코드:${x.ticker} | 기간:${x.start_label}~${x.end_label}(${x.years_analyzed}년) | 재무확보:${x.data_years_count}개년`;
   const pstr=v=>v!=null?(v>=0?'+':'')+v.toFixed(1)+'%':'N/A';
   const ms=[['시작가',N(x.start_price)+'원'],['현재가',N(x.end_price)+'원'],
     ['주가상승분',N(x.price_appreciation)+'원 ('+pstr(x.price_appreciation_pct)+')'],
@@ -658,15 +751,30 @@ with st.sidebar:
     st.markdown("#### 📅 분석 기간")
     col1, col2 = st.columns(2)
     with col1:
-        start_year = st.number_input("시작 연도", min_value=2000,
-                                     max_value=2035, value=2010, step=1)
+        start_date_str = st.text_input(
+            "시작 연월",
+            value="2010",
+            placeholder="2010 또는 2010.06",
+            help="연도(예: 2010=연말) 또는 연·월(예: 2010.06).",
+        )
     with col2:
         end_date_str = st.text_input(
             "종료 연월",
             value="2026.03",
             placeholder="2024 또는 2026.03",
-            help="연도만 입력(예: 2024) 또는 연·월 입력(예: 2026.03). 월 기준 시 해당 월 마지막 거래일 종가와 최신 공시 재무 사용.",
+            help="연도(예: 2024=연말) 또는 연·월(예: 2026.03).",
         )
+
+    # 시작 연도·월 파싱
+    start_year, start_month, _start_ok = 2010, 12, False
+    _ms = re.match(r"^(\d{4})(?:\.(\d{1,2}))?$", start_date_str.strip())
+    if _ms:
+        _sy = int(_ms.group(1))
+        _sm = int(_ms.group(2)) if _ms.group(2) else 12
+        if 2000 <= _sy <= 2040 and 1 <= _sm <= 12:
+            start_year, start_month, _start_ok = _sy, _sm, True
+    if not _start_ok:
+        st.error("❌ 시작 연월 형식 오류: 연도(예: 2010) 또는 연·월(예: 2010.06)")
 
     # 종료 연도·월 파싱
     end_year, end_month, _date_ok = 2026, 3, False
@@ -677,14 +785,17 @@ with st.sidebar:
         if 2001 <= _ey <= 2040 and 1 <= _em <= 12:
             end_year, end_month, _date_ok = _ey, _em, True
     if not _date_ok:
-        st.error("❌ 형식 오류: 연도(예: 2024) 또는 연·월(예: 2026.03) 형식으로 입력하세요.")
+        st.error("❌ 종료 연월 형식 오류: 연도(예: 2024) 또는 연·월(예: 2026.03)")
 
-    if start_year >= end_year:
-        st.error("시작연도 < 종료연도 이어야 합니다.")
+    # 시작 < 종료 검증
+    _period_ok = True
+    if start_year > end_year or (start_year == end_year and start_month >= end_month):
+        st.error("시작 연월이 종료 연월보다 이전이어야 합니다.")
+        _period_ok = False
 
     st.markdown("---")
 
-    _run_disabled = (not dart_api_key) or (not _date_ok) or (start_year >= end_year)
+    _run_disabled = (not dart_api_key) or (not _start_ok) or (not _date_ok) or (not _period_ok)
     run_btn = st.button(
         "🚀 분석 시작",
         type="primary",
@@ -913,6 +1024,7 @@ if run_btn:
             ticker,
             int(start_year),
             int(end_year),
+            start_month=int(start_month),
             end_month=int(end_month),
             dart_inst=dart_instance,
             corp_codes=corp_codes_df,
@@ -929,10 +1041,11 @@ if run_btn:
         st.error("분석 가능한 결과가 없습니다. 종목코드 또는 DART 데이터를 확인하세요.")
         st.stop()
 
-    st.session_state["results"]    = results
-    st.session_state["start_year"] = start_year
-    st.session_state["end_year"]   = end_year
-    st.session_state["end_month"]  = end_month
+    st.session_state["results"]     = results
+    st.session_state["start_year"]  = start_year
+    st.session_state["start_month"] = start_month
+    st.session_state["end_year"]    = end_year
+    st.session_state["end_month"]   = end_month
     st.success(f"✅ 분석 완료! {len(results)}개 종목")
 
 # ── 결과 표시 ─────────────────────────────────────────────────
@@ -961,7 +1074,7 @@ if results:
         rows.append({
             "종목명":      r["name"],
             "코드":        r["ticker"],
-            "분석기간":    f"{r['start_year']}~{r['end_label']} ({r['years_analyzed']}y)",
+            "분석기간":    f"{r['start_label']}~{r['end_label']} ({r['years_analyzed']}y)",
             "시작가(원)":  f"{r['start_price']:,.0f}",
             "현재가(원)":  f"{r['end_price']:,.0f}",
             "수익률":      f"{r['price_appreciation_pct']:+.1f}%" if r['price_appreciation_pct'] else "N/A",
@@ -985,7 +1098,10 @@ if results:
 
     with col_l:
         st.markdown(f"**{r['name']}** `{r['ticker']}`")
-        st.markdown(f"분석기간: **{r['start_year']} ~ {r['end_label']}** ({r['years_analyzed']}년)")
+        st.markdown(f"분석기간: **{r['start_label']} ~ {r['end_label']}** ({r['years_analyzed']}년)")
+        if r.get("split_events"):
+            for _, _, desc in r["split_events"]:
+                st.caption(f"⚠️ {desc}")
         if r.get("latest_eps_label"):
             st.caption(f"📋 마지막 연도 EPS 기준: {r['latest_eps_label']}")
         st.markdown(f"재무 확보: **{r['data_years_count']}**개연도")
@@ -1057,13 +1173,15 @@ if results:
     st.markdown("### 💾 결과 저장")
     html_out = build_html(results, datetime.now().strftime("%Y년 %m월 %d일"))
     sy = st.session_state.get("start_year", start_year)
+    sm = st.session_state.get("start_month", start_month)
     ey = st.session_state.get("end_year",   end_year)
     em = st.session_state.get("end_month",  end_month)
-    end_file_str = f"{ey}_{em:02d}" if em != 12 else str(ey)
+    start_file_str = f"{sy}_{sm:02d}" if sm != 12 else str(sy)
+    end_file_str   = f"{ey}_{em:02d}" if em != 12 else str(ey)
     st.download_button(
         label="📥 HTML 대시보드 다운로드",
         data=html_out.encode("utf-8"),
-        file_name=f"warren_buffett_{sy}_{end_file_str}.html",
+        file_name=f"warren_buffett_{start_file_str}_{end_file_str}.html",
         mime="text/html",
         use_container_width=True,
         type="secondary",
