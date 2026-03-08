@@ -1,0 +1,8 @@
+.streamlit/secrets.toml
+__pycache__/
+*.pyc
+.env
+진단테스트*.py
+진단결과*.txt
+실행.bat
+.DS_Store
