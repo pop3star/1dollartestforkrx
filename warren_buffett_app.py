@@ -221,7 +221,7 @@ def get_month_end_price(ticker: str, year: int, month: int) -> float | None:
 
 
 def _extract_eps_from_fs(fs: pd.DataFrame) -> dict | None:
-    """재무제표 DataFrame에서 EPS/DPS 추출 — 공통 로직"""
+    """재무제표 DataFrame에서 EPS/DPS/순이익 추출 — 공통 로직"""
     nm_col  = next((c for c in fs.columns if "account_nm"    in c.lower()), None)
     amt_col = next((c for c in fs.columns if "thstrm_amount" in c.lower()), None)
     if nm_col is None or amt_col is None:
@@ -249,8 +249,12 @@ def _extract_eps_from_fs(fs: pd.DataFrame) -> dict | None:
     eps = find(["기본주당이익(손실)", "기본주당순이익(손실)",
                 "기본주당이익", "기본주당순이익", "주당순이익", "주당이익", "주당손익"])
     dps = find(["주당배당금", "주당현금배당금", "현금배당금(주당)", "1주당 배당금"])
+    
+    # NEW: 당기순이익 교차 검증용 데이터 추가 추출
+    ni  = find(["당기순이익(손실)", "당기순이익", "연결당기순이익", "연결당기순손익", "반기순이익", "분기순이익", "당기순손익"])
+    
     if eps is not None:
-        return {"EPS": eps, "DPS": dps or 0.0}
+        return {"EPS": eps, "DPS": dps or 0.0, "NI": ni}
     return None
 
 
@@ -284,13 +288,10 @@ def get_eps_dps_latest(ticker: str, year: int,
     return None, None
 
 
-def adjust_eps_for_splits(fund_by_year: dict, log_fn=None) -> tuple[dict, list]:
+def adjust_eps_for_splits(fund_by_year: dict, price_by_year: dict = None, log_fn=None) -> tuple[dict, list]:
     """
-    연도별 EPS의 급격한 변동을 감지하여 액면분할/병합 보정.
-    FinanceDataReader 주가는 수정주가(split-adjusted)인 반면,
-    DART EPS는 해당 연도 실제 주식수 기준이므로 불일치 발생.
-    → 모든 EPS를 최신(현재) 주식수 기준으로 통일.
-    반환: (보정된 fund_by_year, 감지된 이벤트 목록)
+    연도별 EPS 변동을 감지하여 액면분할/병합 보정.
+    [교차 검증 로직] 순이익 증감률 또는 수정주가 P/E 증감률을 사용하여 펀더멘털 변동과 액면분할을 완벽히 구분.
     """
     years = sorted(fund_by_year.keys())
     if len(years) < 2:
@@ -300,40 +301,81 @@ def adjust_eps_for_splits(fund_by_year: dict, log_fn=None) -> tuple[dict, list]:
         if log_fn:
             log_fn(msg)
 
-    events: list[tuple[int, float, str]] = []   # (year, ratio, description)
+    events: list[tuple[int, float, str]] = []   
+    common_ratios = [2, 3, 4, 5, 10, 20, 25, 50, 100]
 
     for i in range(1, len(years)):
-        eps_prev = fund_by_year[years[i - 1]]["EPS"]
-        eps_curr = fund_by_year[years[i]]["EPS"]
+        y_prev, y_curr = years[i - 1], years[i]
+        
+        eps_prev = fund_by_year[y_prev]["EPS"]
+        eps_curr = fund_by_year[y_curr]["EPS"]
+        ni_prev  = fund_by_year[y_prev].get("NI")
+        ni_curr  = fund_by_year[y_curr].get("NI")
+
         if eps_prev is None or eps_curr is None:
             continue
         if eps_prev <= 0 or eps_curr <= 0:
             continue
 
-        ratio = eps_prev / eps_curr
-        common = [2, 3, 4, 5, 10, 20, 25, 50, 100]
+        eps_ratio = eps_prev / eps_curr
+        implied_ratio = eps_ratio
+        validation_msg = ""
+        is_validated = False
 
-        if ratio > 1.8:
-            # 액면분할 감지 (EPS 급감)
-            best = min(common, key=lambda x: abs(x - ratio))
-            if abs(best - ratio) / best < 0.30:
-                desc = f"{years[i]}년 액면분할 {best}:1 감지 (EPS {eps_prev:,.0f}→{eps_curr:,.0f})"
-                events.append((years[i], float(best), desc))
-                _log(f"⚠️ {desc}")
-        elif ratio < 0.55:
-            # 액면병합(역분할) 감지 (EPS 급증)
-            inv = 1 / ratio
-            best = min(common, key=lambda x: abs(x - inv))
-            if abs(best - inv) / best < 0.30:
-                factor = 1.0 / best
-                desc = f"{years[i]}년 액면병합 1:{best} 감지 (EPS {eps_prev:,.0f}→{eps_curr:,.0f})"
-                events.append((years[i], factor, desc))
-                _log(f"⚠️ {desc}")
+        # [교차검증 1] 당기순이익(Net Income) 활용 - 순수하게 주식 수 증감 비율만 발라냄
+        if ni_prev and ni_curr and ni_prev > 0 and ni_curr > 0:
+            ni_ratio = ni_prev / ni_curr
+            implied_ratio = eps_ratio / ni_ratio
+            is_validated = True
+            validation_msg = "순이익 검증"
+        
+        # [교차검증 2] 수정주가(Price) 활용 - 순이익 데이터가 없을 때 P/E 급변 검증
+        elif price_by_year and y_prev in price_by_year and y_curr in price_by_year:
+            p_prev, p_curr = price_by_year[y_prev], price_by_year[y_curr]
+            if p_prev > 0 and p_curr > 0:
+                pe_prev = p_prev / eps_prev
+                pe_curr = p_curr / eps_curr
+                implied_ratio = pe_curr / pe_prev
+                is_validated = True
+                validation_msg = "주가 검증"
+
+        is_split, is_merge, best_ratio = False, False, 1.0
+
+        # 분할 감지 (EPS 급감 방어)
+        if implied_ratio > 1.8:
+            best = min(common_ratios, key=lambda x: abs(x - implied_ratio))
+            # 검증 완료 시 오차 25% 허용, 미검증 시(위험) 10%만 허용 + 5배 이상일때만 인정
+            tolerance = 0.25 if is_validated else 0.10
+            if abs(best - implied_ratio) / best < tolerance:
+                if is_validated or best >= 5:
+                    is_split = True
+                    best_ratio = float(best)
+
+        # 병합 감지 (EPS 급증 방어)
+        elif implied_ratio < 0.55:
+            inv = 1 / implied_ratio
+            best = min(common_ratios, key=lambda x: abs(x - inv))
+            tolerance = 0.25 if is_validated else 0.10
+            if abs(best - inv) / best < tolerance:
+                if is_validated or best >= 5:
+                    is_merge = True
+                    best_ratio = 1.0 / best
+
+        if is_split:
+            desc = f"{y_curr}년 액면분할 {int(best_ratio)}:1 감지 (EPS {eps_prev:,.0f}→{eps_curr:,.0f})"
+            if validation_msg: desc += f" [{validation_msg}]"
+            events.append((y_curr, best_ratio, desc))
+            _log(f"⚠️ {desc}")
+        elif is_merge:
+            desc = f"{y_curr}년 액면병합 1:{int(best_ratio)} 감지 (EPS {eps_prev:,.0f}→{eps_curr:,.0f})"
+            if validation_msg: desc += f" [{validation_msg}]"
+            events.append((y_curr, best_ratio, desc))
+            _log(f"⚠️ {desc}")
 
     if not events:
         return fund_by_year, []
 
-    # 보정: 분할 이전 연도 EPS를 현재 주식수 기준으로 축소
+    # 보정: 과거 EPS/DPS를 현재 주식수 기준으로 축소
     adjusted = {}
     for y in years:
         divisor = 1.0
@@ -343,6 +385,7 @@ def adjust_eps_for_splits(fund_by_year: dict, log_fn=None) -> tuple[dict, list]:
         adjusted[y] = {
             "EPS": round(fund_by_year[y]["EPS"] / divisor, 2),
             "DPS": round(fund_by_year[y]["DPS"] / divisor, 2),
+            "NI": fund_by_year[y].get("NI")
         }
 
     return adjusted, events
@@ -434,7 +477,7 @@ def analyze_stock(
         return None
 
     # ── 액면분할/병합 EPS 보정 ─────────────────────────────────
-    fund_by_year, split_events = adjust_eps_for_splits(fund_by_year, log_fn=log)
+    fund_by_year, split_events = adjust_eps_for_splits(fund_by_year, price_by_year=price_by_year, log_fn=log)
     if split_events:
         log(f"[{ticker}] 액면분할/병합 {len(split_events)}건 감지 → EPS/DPS 보정 적용")
 
