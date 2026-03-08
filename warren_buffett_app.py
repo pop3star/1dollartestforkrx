@@ -221,7 +221,7 @@ def get_month_end_price(ticker: str, year: int, month: int) -> float | None:
 
 
 def _extract_eps_from_fs(fs: pd.DataFrame) -> dict | None:
-    """재무제표 DataFrame에서 EPS/DPS/순이익 추출 — 공통 로직"""
+    """재무제표 DataFrame에서 EPS/DPS/순이익 추출 (중단영업 합산 및 희석 제외 로직 포함)"""
     nm_col  = next((c for c in fs.columns if "account_nm"    in c.lower()), None)
     amt_col = next((c for c in fs.columns if "thstrm_amount" in c.lower()), None)
     if nm_col is None or amt_col is None:
@@ -239,6 +239,12 @@ def _extract_eps_from_fs(fs: pd.DataFrame) -> dict | None:
                 rows = work_fs[mask]
                 if rows.empty:
                     continue
+                
+                # [안전장치] '희석'이 포함된 계정명은 철저히 배제 (기본주당이익만 추출)
+                rows = rows[~rows[nm_col].astype(str).str.contains("희석")]
+                if rows.empty:
+                    continue
+
                 val = rows.iloc[0][amt_col]
                 if pd.notna(val) and str(val).strip() not in ("", "-", "―"):
                     return float(str(val).replace(",", "").replace(" ", ""))
@@ -246,12 +252,24 @@ def _extract_eps_from_fs(fs: pd.DataFrame) -> dict | None:
                 pass
         return None
 
-    eps = find(["기본주당이익(손실)", "기본주당순이익(손실)",
-                "기본주당이익", "기본주당순이익", "주당순이익", "주당이익", "주당손익"])
-    dps = find(["주당배당금", "주당현금배당금", "현금배당금(주당)", "1주당 배당금"])
+    # 1순위: 전체 '기본주당이익'이 하나로 합산되어 공시된 경우 우선 탐색
+    eps = find([
+        "기본주당이익", "기본주당순이익", "보통주기본주당이익", 
+        "보통주 1주당 순이익", "주당순이익", "주당이익", "주당손익"
+    ])
     
-    # NEW: 당기순이익 교차 검증용 데이터 추가 추출
-    ni  = find(["당기순이익(손실)", "당기순이익", "연결당기순이익", "연결당기순손익", "반기순이익", "분기순이익", "당기순손익"])
+    # 2순위: 전체 EPS가 없고, 계속/중단 영업으로 나뉘어 공시된 경우 (한화솔루션 등 과거 데이터)
+    if eps is None:
+        eps_cont = find(["계속영업기본주당이익", "계속영업주당이익", "계속영업주당순이익", "계속영업 보통주 1주당순이익", "계속영업"])
+        eps_disc = find(["중단영업기본주당이익", "중단영업주당이익", "중단영업주당순이익", "중단영업 보통주 1주당순이익", "중단영업"])
+        
+        # 계속영업이익이 존재한다면, 중단영업이익을 찾아서 더해줌 (없으면 0 처리)
+        if eps_cont is not None:
+            eps = eps_cont + (eps_disc if eps_disc is not None else 0.0)
+
+    # 배당금 및 당기순이익 탐색
+    dps = find(["주당배당금", "주당현금배당금", "현금배당금(주당)", "1주당 배당금"])
+    ni  = find(["당기순이익", "당기순손익", "연결당기순이익", "연결당기순손익", "반기순이익", "분기순이익"])
     
     if eps is not None:
         return {"EPS": eps, "DPS": dps or 0.0, "NI": ni}
