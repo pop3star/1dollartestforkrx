@@ -225,8 +225,6 @@ def _extract_eps_from_fs(fs: pd.DataFrame) -> dict | None:
     
     nm_col  = next((c for c in fs.columns if "account_nm" in c.lower()), None)
     amt_col = next((c for c in fs.columns if "thstrm_amount" in c.lower()), None)
-    
-    # NEW: 3분기/반기 보고서의 누적 EPS를 가져오기 위한 당기누적금액 컬럼 탐색
     add_amt_col = next((c for c in fs.columns if "thstrm_add_amount" in c.lower()), None)
     
     if nm_col is None or amt_col is None:
@@ -254,14 +252,12 @@ def _extract_eps_from_fs(fs: pd.DataFrame) -> dict | None:
                 val = None
                 
                 # [안전장치 2] 1순위: 당기누적금액 (thstrm_add_amount) 확인
-                # 분기/반기 보고서에서는 3개월 치가 아닌 '누적 금액'을 가져와야 함
                 if add_amt_col and pd.notna(row.get(add_amt_col)):
                     v = str(row[add_amt_col]).strip()
                     if v not in ("", "-", "―"):
                         val = v
                         
                 # [안전장치 3] 2순위: 당기누적금액이 없으면 당기금액 (thstrm_amount) 사용
-                # 연간 사업보고서는 보통 누적금액 컬럼 없이 당기금액만 존재함
                 if val is None and pd.notna(row.get(amt_col)):
                     v = str(row[amt_col]).strip()
                     if v not in ("", "-", "―"):
@@ -294,6 +290,36 @@ def _extract_eps_from_fs(fs: pd.DataFrame) -> dict | None:
     if eps is not None:
         return {"EPS": eps, "DPS": dps or 0.0, "NI": ni}
     return None
+
+
+def get_eps_dps_latest(ticker: str, year: int,
+                       dart_inst, corp_codes) -> tuple:
+    """
+    지정 연도 기준 최신 공시에서 EPS/DPS 조회.
+    연간(11011) → 3분기(11014) → 반기(11012) → 1분기(11013) 순 시도.
+    반환: (dict | None, label | None)
+    """
+    corp_code = ticker_to_corp_code(ticker, corp_codes)
+    if not corp_code:
+        return None, None
+
+    attempts = [
+        ("11011", f"{year}년 연간"),
+        ("11014", f"{year}년 3분기(9개월)"),
+        ("11012", f"{year}년 반기(6개월)"),
+        ("11013", f"{year}년 1분기(3개월)"),
+    ]
+    for reprt_code, label in attempts:
+        try:
+            fs = dart_inst.finstate_all(corp_code, str(year), reprt_code)
+            if fs is None or (isinstance(fs, pd.DataFrame) and fs.empty):
+                continue
+            result = _extract_eps_from_fs(fs)
+            if result:
+                return result, label
+        except Exception:
+            continue
+    return None, None
 
 def adjust_eps_for_splits(fund_by_year: dict, price_by_year: dict = None, log_fn=None) -> tuple[dict, list]:
     """
